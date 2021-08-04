@@ -49,7 +49,9 @@ int MPI_Finalize(void)
         OMPI_ERR_INIT_FINALIZE(FUNC_NAME);
     }
 
-    /* Pretty simple */
+    /* For some reason, finalize fails if we block without a timeout ... so add one */
+    opal_progress_set_block_timeout(100);
 
+    /* Pretty simple */
     return ompi_mpi_finalize();
 }

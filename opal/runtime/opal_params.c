@@ -151,15 +151,25 @@ int opal_register_params(void)
         return ret;
     }
 
+    opal_progress_spins_poll = -1;
+    ret = mca_base_var_register ("ompi", "mpi", NULL, "spins_poll",
+                                 "How often to poll before falling back to yield/block (-1 means infinity and is the default) when waiting on progress",
+                                 MCA_BASE_VAR_TYPE_INT, NULL, 0, MCA_BASE_VAR_FLAG_SETTABLE,
+                                 OPAL_INFO_LVL_9, MCA_BASE_VAR_SCOPE_LOCAL,
+                                 &opal_progress_spins_poll);
+    if (0 > ret) {
+        return ret;
+    }
 
-#if defined(HAVE_SCHED_YIELD)
-    opal_progress_yield_when_idle = false;
-    ret = mca_base_var_register ("opal", "opal", "progress", "yield_when_idle",
-                                 "Yield the processor when waiting on progress",
-                                 MCA_BASE_VAR_TYPE_BOOL, NULL, 0, MCA_BASE_VAR_FLAG_SETTABLE,
-                                 OPAL_INFO_LVL_8, MCA_BASE_VAR_SCOPE_LOCAL,
-                                 &opal_progress_yield_when_idle);
-#endif
+    opal_progress_spins_yield = -1;
+    ret = mca_base_var_register ("ompi", "mpi", NULL, "spins_yield",
+                                 "How often to yield before falling back block (-1 means infinity and is the default) when waiting on progress",
+                                 MCA_BASE_VAR_TYPE_INT, NULL, 0, MCA_BASE_VAR_FLAG_SETTABLE,
+                                 OPAL_INFO_LVL_9, MCA_BASE_VAR_SCOPE_LOCAL,
+                                 &opal_progress_spins_yield);
+    if (0 > ret) {
+        return ret;
+    }
 
 #if OPAL_ENABLE_DEBUG
     opal_progress_debug = false;

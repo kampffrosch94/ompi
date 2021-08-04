@@ -120,10 +120,61 @@ OPAL_DECLSPEC void opal_progress_event_users_decrement(void);
  * By default, the event loop will yield when the progress function is
  * idle.
  *
+ * \deprecated{see spins_poll()}
+ *
  * @param   yieldopt  Whether to yield when idle.
  * @return         Previous value of the yield_when_idle option.
  */
 OPAL_DECLSPEC bool opal_progress_set_yield_when_idle(bool yieldopt);
+
+
+/**
+ * Set how often opal_progress() should poll for events
+ *
+ * Set how often opal_progress() should execute just the polling progress loop.
+ * Any progress resets the counter.  By default, this will be -1, i.e.
+ * forever/always.
+ *
+ * @param   spins_poll  Number of times to poll for events.
+ * @return  Previous value of the spins_poll option.
+ */
+OPAL_DECLSPEC int opal_progress_set_spins_poll(int spins_poll);
+
+
+/**
+ * Set how often opal_progress() should yield after checking for events
+ *
+ * Set how often opal_progress() should yield to another thread after
+ * unsuccessfully executing the polling progress loop.  This value combines
+ * with spins_poll:  The progress loop will just poll for spins_poll times,
+ * after that it will (poll and) yield for spins_yield times. Thus, after
+ * spins_poll + spins_yield executions of the progress loop, we will block;
+ * also see block_timeout.  Any progress resets the counter.
+ *
+ * By default, this will be -1, i.e. forever/always.
+ *
+ * @param   spins_poll  Number of times to yield after polling for events.
+ * @return  Previous value of the spins_yield option.
+ */
+OPAL_DECLSPEC int opal_progress_set_spins_yield(int spins_yield);
+
+
+/**
+ * Set how long opal_progress() should block at max after being idle
+ *
+ * Set how long opal_progress() should block the process (by calling
+ * blocking progress) if no events were progressed during the polling
+ * progress loop.  The return value of the callback functions is used
+ * to determine whether or not progress has been made and blocking is
+ * required.  This setting is only relevant if spins_poll and
+ * spins_yield are set to positive values.
+ *
+ * By default, this will be -1, i.e. forever.
+ *
+ * @param   block_timeout  Timeout for blocking.
+ * @return  Previous value of the block_timeout option.
+ */
+OPAL_DECLSPEC int opal_progress_set_block_timeout(int block_timeout);
 
 
 /**
@@ -165,6 +216,8 @@ OPAL_DECLSPEC int opal_progress_register(opal_progress_callback_t cb);
 
 OPAL_DECLSPEC int opal_progress_register_lp (opal_progress_callback_t cb);
 
+OPAL_DECLSPEC int opal_progress_register_block (opal_progress_callback_t cb);
+
 
 /**
  * Deregister previously registered event
@@ -179,6 +232,15 @@ OPAL_DECLSPEC extern int opal_progress_spin_count;
 
 /* do we want to call sched_yield() if nothing happened */
 OPAL_DECLSPEC extern bool opal_progress_yield_when_idle;
+
+/* how often do we just poll in the progress loop */
+OPAL_DECLSPEC extern int opal_progress_spins_poll;
+
+/* how often do we yield after polling in the progress loop */
+OPAL_DECLSPEC extern int opal_progress_spins_yield;
+
+/* how long do we block at max if no progress has been made */
+OPAL_DECLSPEC extern int opal_progress_block_timeout;
 
 /**
  * Progress until flag is true or poll iterations completed

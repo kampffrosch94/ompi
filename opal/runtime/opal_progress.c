@@ -65,8 +65,13 @@ static volatile opal_progress_callback_t *callbacks_lp = NULL;
 static size_t callbacks_lp_len = 0;
 static size_t callbacks_lp_size = 0;
 
-/* do we want to call sched_yield() if nothing happened */
-bool opal_progress_yield_when_idle = false;
+static volatile opal_progress_callback_t *callbacks_block = NULL;
+static size_t callbacks_block_len = 0;
+static size_t callbacks_block_size = 0;
+
+int opal_progress_spins_poll = 0; // how often to just poll
+int opal_progress_spins_yield = 0; // how often to yield after polling
+int opal_progress_block_timeout = 0; // how long to block at max (if we do so)
 
 #if OPAL_PROGRESS_USE_TIMERS
 static opal_timer_t event_progress_last_time = 0;
@@ -114,16 +119,18 @@ opal_progress_init(void)
     }
 #endif
 
-    callbacks_size = callbacks_lp_size = 8;
+    callbacks_size = callbacks_lp_size = callbacks_block_size = 8;
 
     callbacks = malloc (callbacks_size * sizeof (callbacks[0]));
     callbacks_lp = malloc (callbacks_lp_size * sizeof (callbacks_lp[0]));
+    callbacks_block = malloc (callbacks_block_size * sizeof (callbacks_block[0]));
 
-    if (NULL == callbacks || NULL == callbacks_lp) {
+    if (NULL == callbacks || NULL == callbacks_lp || NULL == callbacks_block) {
         free ((void *) callbacks);
         free ((void *) callbacks_lp);
-        callbacks_size = callbacks_lp_size = 0;
-        callbacks = callbacks_lp = NULL;
+        free ((void *) callbacks_block);
+        callbacks_size = callbacks_lp_size = callbacks_block_size = 0;
+        callbacks = callbacks_lp = callbacks_block = NULL;
         return OPAL_ERR_OUT_OF_RESOURCE;
     }
 
@@ -135,10 +142,18 @@ opal_progress_init(void)
         callbacks_lp[i] = fake_cb;
     }
 
+    for (size_t i = 0 ; i < callbacks_block_size ; ++i) {
+        callbacks_block[i] = fake_cb;
+    }
+
     OPAL_OUTPUT((debug_output, "progress: initialized event flag to: %x",
                  opal_progress_event_flag));
-    OPAL_OUTPUT((debug_output, "progress: initialized yield_when_idle to: %s",
-                 opal_progress_yield_when_idle ? "true" : "false"));
+    OPAL_OUTPUT((debug_output, "progress: initialized spins_poll to: %d",
+                 opal_progress_spins_poll));
+    OPAL_OUTPUT((debug_output, "progress: initialized spins_yield to: %d",
+                 opal_progress_spins_yield));
+    OPAL_OUTPUT((debug_output, "progress: initialized block_timeout to: %d",
+                 opal_progress_block_timeout));
     OPAL_OUTPUT((debug_output, "progress: initialized num users to: %d",
                  num_event_users));
     OPAL_OUTPUT((debug_output, "progress: initialized poll rate to: %ld",
@@ -163,6 +178,11 @@ opal_progress_finalize(void)
     callbacks_lp_size = 0;
     free ((void *) callbacks_lp);
     callbacks_lp = NULL;
+
+    callbacks_block_len = 0;
+    callbacks_block_size = 0;
+    free ((void *) callbacks_block);
+    callbacks_block = NULL;
 
     opal_atomic_unlock(&progress_lock);
 
@@ -210,11 +230,11 @@ static int opal_progress_events(void)
 
 /*
  * Progress the event library and any functions that have registered to
- * be called.  We don't propogate errors from the progress functions,
+ * be called.  We don't propagate errors from the progress functions,
  * so no action is taken if they return failures.  The functions are
  * expected to return the number of events progressed, to determine
  * whether or not we should call sched_yield() during MPI progress.
- * This is only losely tracked, as an error return can cause the number
+ * This is only loosely tracked, as an error return can cause the number
  * of progressed events to appear lower than it actually is.  We don't
  * care, as the cost of that happening is far outweighed by the cost
  * of the if checks (they were resulting in bad pipe stalling behavior)
@@ -223,6 +243,7 @@ void
 opal_progress(void)
 {
     static uint32_t num_calls = 0;
+    static uint32_t num_tries = 0;
     size_t i;
     int events = 0;
 
@@ -247,16 +268,66 @@ opal_progress(void)
         opal_progress_events();
     }
 
+    /* if we got an event ... profit! */
+    if (events > 0) {
+        goto reset_tries;
+    }
+
+    ++num_tries; // we tried once more
+
+    /* Overall scheme:
+     * - poll for 'opal_progress_spins_poll' calls (at least once)
+     * - yield for another 'opal_progress_spins_yield' calls
+     * - block with a timeout of 'opal_progress_block_timeout'
+     *
+     * 'poll' here refers to the callbacks already handled above, so this is
+     * always done. What changes is whether we return immediately. Once some
+     * progress is made, the whole sequence starts from the beginning.
+     *
+     * Examples:
+     *
+     *  spins_poll | spins_yield | effect
+     * --------------------------------------
+     *       -1    |      *      | poll always
+     * --------------------------------------
+     *        0    |     -1      | poll+yield always
+     *        0    |      0      | poll+block always
+     *        0    |      x      | poll+yield x times, then poll+block always
+     * --------------------------------------
+     *        x    |     -1      | poll x times, then poll+yield always
+     *        x    |      0      | poll x times, then poll+block always
+     *        x    |      y      | poll x times, then poll+yield y times, then poll+block always
+     * --------------------------------------
+     */
+
+    if (OPAL_LIKELY(opal_progress_spins_poll == -1 ||
+                    num_tries <= opal_progress_spins_poll)
+    ) {
+        return;
+    }
+
 #if OPAL_HAVE_SCHED_YIELD
-    if (opal_progress_yield_when_idle && events <= 0) {
-        /* If there is nothing to do - yield the processor - otherwise
-         * we could consume the processor for the entire time slice. If
-         * the processor is oversubscribed - this will result in a best-case
-         * latency equivalent to the time-slice.
-         */
+    if (opal_progress_spins_yield == -1 ||
+        num_tries <= (opal_progress_spins_poll + opal_progress_spins_yield)
+    ) {
         sched_yield();
+        return;
     }
 #endif  /* defined(HAVE_SCHED_YIELD) */
+
+    /* Use only one blocking callback per progress loop iteration */
+	 if (OPAL_UNLIKELY(callbacks_block_len < 1)) { return; }
+    static uint32_t cur_callback = -1; // overflow is defined for unsigned
+
+    /* update first ... just in case the length changes */
+    cur_callback = (cur_callback + 1) % callbacks_block_len;
+    events += (callbacks_block[cur_callback])();
+
+    if (events > 0) {
+reset_tries:
+        // reset number of unsuccessful polls and leave
+        num_tries = 0;
+    }
 }
 
 
@@ -318,11 +389,52 @@ opal_progress_event_users_decrement(void)
 bool
 opal_progress_set_yield_when_idle(bool yieldopt)
 {
-    bool tmp = opal_progress_yield_when_idle;
-    opal_progress_yield_when_idle = (yieldopt) ? 1 : 0;
+/*
+    bool tmp = opal_progress_set_spins_poll < 0;
 
-    OPAL_OUTPUT((debug_output, "progress: progress_set_yield_when_idle to %s",
-                                    opal_progress_yield_when_idle ? "true" : "false"));
+    OPAL_OUTPUT((debug_output, "progress: forwarding progress_set_yield_when_idle change to opal_progress_set_spins_poll"));
+
+    opal_progress_set_spins_poll((yieldopt) ? 0 : -1);
+*/
+    /* Neuter the old function as its overused and interferes */
+    return false;
+}
+
+
+int
+opal_progress_set_spins_poll(int spins_poll)
+{
+    int tmp = opal_progress_spins_poll;
+    opal_progress_spins_poll = spins_poll;
+
+    OPAL_OUTPUT((debug_output, "progress: progress_set_spins_poll to %d",
+                                    opal_progress_spins_poll));
+
+    return tmp;
+}
+
+
+int
+opal_progress_set_spins_yield(int spins_yield)
+{
+    int tmp = opal_progress_spins_yield;
+    opal_progress_spins_yield = spins_yield;
+
+    OPAL_OUTPUT((debug_output, "progress: progress_set_spins_yield to %d",
+                                    opal_progress_spins_yield));
+
+    return tmp;
+}
+
+
+int
+opal_progress_set_block_timeout(int block_timeout)
+{
+    int tmp = opal_progress_block_timeout;
+    opal_progress_block_timeout = block_timeout;
+
+    OPAL_OUTPUT((debug_output, "progress: progress_set_block_timeout to %d",
+                                    opal_progress_block_timeout));
 
     return tmp;
 }
@@ -433,6 +545,7 @@ int opal_progress_register (opal_progress_callback_t cb)
     opal_atomic_lock(&progress_lock);
 
     (void) _opal_progress_unregister (cb, callbacks_lp, &callbacks_lp_len);
+    (void) _opal_progress_unregister (cb, callbacks_block, &callbacks_block_len);
 
     ret = _opal_progress_register (cb, &callbacks, &callbacks_size, &callbacks_len);
 
@@ -448,8 +561,25 @@ int opal_progress_register_lp (opal_progress_callback_t cb)
     opal_atomic_lock(&progress_lock);
 
     (void) _opal_progress_unregister (cb, callbacks, &callbacks_len);
+    (void) _opal_progress_unregister (cb, callbacks_block, &callbacks_block_len);
 
     ret = _opal_progress_register (cb, &callbacks_lp, &callbacks_lp_size, &callbacks_lp_len);
+
+    opal_atomic_unlock(&progress_lock);
+
+    return ret;
+}
+
+int opal_progress_register_block (opal_progress_callback_t cb)
+{
+    int ret;
+
+    opal_atomic_lock(&progress_lock);
+
+    (void) _opal_progress_unregister (cb, callbacks, &callbacks_len);
+    (void) _opal_progress_unregister (cb, callbacks_lp, &callbacks_lp_len);
+
+    ret = _opal_progress_register (cb, &callbacks_block, &callbacks_block_size, &callbacks_block_len);
 
     opal_atomic_unlock(&progress_lock);
 
@@ -492,6 +622,12 @@ int opal_progress_unregister (opal_progress_callback_t cb)
         /* if not in the high-priority array try to remove from the lp array.
          * a callback will never be in both. */
         ret = _opal_progress_unregister (cb, callbacks_lp, &callbacks_lp_len);
+    }
+
+    if (OPAL_SUCCESS != ret) {
+        /* if not in the lp array try to remove from the block array.
+         * a callback will never be in both. */
+        ret = _opal_progress_unregister (cb, callbacks_block, &callbacks_block_len);
     }
 
     opal_atomic_unlock(&progress_lock);
